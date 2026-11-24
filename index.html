@@ -379,7 +379,7 @@ function funFact(lb, seed) {
 const hash = s => { let h = 0; for (const c of String(s)) h = (h * 31 + c.charCodeAt(0)) | 0; return h; };
 
 // ───────────────────────── backend (Supabase) + rest-over push ─────────────────────────
-const CFG = { url: "https://jspnmcweqzzeliqiznxb.supabase.co", anon: "__ANON_KEY__" };
+const CFG = { url: "https://jspnmcweqzzeliqiznxb.supabase.co", anon: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImpzcG5tY3dlcXp6ZWxpcWl6bnhiIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTMyMTYyMzksImV4cCI6MjEwODc5MjIzOX0.XY_-9L5u_e7oYh_C4_Jz8-WPSGpiHyWFHiSMW2yVTq8" };
 const PUSH = { on: store.get("pushOn", false), sched: false, q: Promise.resolve() };
 // Mimics the small slice of the document-database API the app uses (collection/doc, get/set/delete, onSnapshot).
 function makeDb(key) {
