@@ -1,0 +1,5 @@
+-- Flattened history for the weekly Google Sheets export (private schema: not exposed to the app's API).
+-- See the applied migration "lift_log_export_views" in Supabase for the full definitions:
+--   private.lift_sets_v      one row per set, with estimated 1RM (Epley, reps + reps-in-reserve from RPE, capped at 12)
+--   private.lift_workouts_v  one row per session
+--   private.lift_progress_v  one row per lift per week: best est. 1RM, heaviest, working sets, volume
