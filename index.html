@@ -132,6 +132,7 @@ h2{font:700 13px/1 var(--body);letter-spacing:.12em;text-transform:uppercase;col
 .rest-bar{height:5px;border-radius:3px;background:var(--panel2);overflow:hidden;max-width:560px;margin:0 auto 8px}
 .rest-bar i{display:block;height:100%;background:var(--accent);transition:width 1s linear}
 .rest.over .rest-t{color:var(--good)}
+.pingbad{color:var(--warn);font-weight:700}
 /* sheets */
 .sheet-bg{position:fixed;inset:0;z-index:60;background:rgba(0,0,0,.5);display:flex;align-items:flex-end;justify-content:center}
 .sheet{width:100%;max-width:560px;max-height:88%;overflow-y:auto;background:var(--panel);border-radius:20px 20px 0 0;padding:18px max(16px,env(safe-area-inset-left,0px)) calc(18px + env(safe-area-inset-bottom,0px)) max(16px,env(safe-area-inset-right,0px));border:1px solid var(--line)}
@@ -293,7 +294,7 @@ const S = {
 let chain = Promise.resolve();
 const write = fn => { const p = chain.then(() => S.db ? fn(S.db) : Promise.reject({ code: "offline" })); chain = p.catch(() => { }); return p; };
 const saveConfig = () => write(db => db.doc("config/main").set(JSON.parse(JSON.stringify(S.config || {}))));
-const PREF_DEFAULTS = { sound: true, voice: true, warn10: true, warmup: true };
+const PREF_DEFAULTS = { sound: true, voice: true, warn10: true, warmup: true, awake: false };
 const prefs = () => ({ ...PREF_DEFAULTS, ...((S.config && S.config.prefs) || {}) });
 // Spoken cues (they play through AirPods too). Needs one tap in the page first, which starting a workout is.
 const say = text => { try { if (!prefs().voice || !window.speechSynthesis) return; window.speechSynthesis.cancel(); const u = new SpeechSynthesisUtterance(text); u.rate = 1.05; window.speechSynthesis.speak(u); } catch (e) { } };
@@ -415,13 +416,23 @@ const b64 = t => { const r = atob((t + "=".repeat((4 - t.length % 4) % 4)).repla
 const standalone = () => navigator.standalone === true || (window.matchMedia && matchMedia("(display-mode: standalone)").matches);
 const pushQ = fn => { PUSH.q = PUSH.q.then(fn).catch(() => { }); };
 // The server sends the "rest over" ping at the rest's end time, so it arrives with the screen off and music playing.
-function pushSchedule(endMs, next) {
-  if (!PUSH.on || !S.db || /^Last set/.test(next || "")) return;
-  PUSH.sched = true;
-  const row = { id: "rest", fire_at: new Date(endMs - 3000).toISOString(), title: "Rest over", body: next ? "Next: " + next : "Time for your next set", tag: "rest", sent: false };
-  pushQ(() => S.db.sb.from("lift_push_queue").upsert(row));
+// PUSH.state: "" (none), "pending", "ok" (server has it), "fail" (no signal; retried every few seconds).
+function pushSchedule(endMs, next, detail) {
+  if (!PUSH.on || !S.db || /^Last set/.test(next || "")) { PUSH.state = ""; pingUI(); return; }
+  PUSH.sched = true; PUSH.state = "pending"; PUSH.tried = Date.now(); pingUI();
+  const my = PUSH.gen = (PUSH.gen || 0) + 1;
+  const row = { id: "rest", fire_at: new Date(endMs - 3000).toISOString(), title: "Rest over", body: next ? `Next: ${next}${detail ? " · " + detail : ""}` : "Time for your next set", tag: "rest", sent: false };
+  const settle = ok => { if (my !== PUSH.gen) return; PUSH.state = ok ? "ok" : "fail"; pingUI(); };
+  pushQ(() => S.db.sb.from("lift_push_queue").upsert(row).then(r => settle(!r.error), () => settle(false)));
 }
-function pushCancel() { if (!PUSH.sched) return; PUSH.sched = false; if (S.db) pushQ(() => S.db.sb.from("lift_push_queue").delete().eq("id", "rest")); }
+function pushCancel() { if (!PUSH.sched) return; PUSH.sched = false; PUSH.gen = (PUSH.gen || 0) + 1; PUSH.state = ""; pingUI(); if (S.db) pushQ(() => S.db.sb.from("lift_push_queue").delete().eq("id", "rest")); }
+function pingUI() {
+  const el = document.getElementById("pingst"); if (!el) return;
+  const st = PUSH.state;
+  el.className = "tiny " + (st === "fail" ? "pingbad" : "muted");
+  el.textContent = st === "ok" ? "🔔 Ping set for the end of this rest" : st === "pending" ? "Setting your ping…" : st === "fail" ? "⚠ No signal: ping not set yet. Keep Lift Log on screen; retrying." : "";
+}
+window.addEventListener("online", () => { if (PUSH.state === "fail" && S.restEnd > Date.now() + 8000) pushSchedule(S.restEnd, S.restNext, S.restDetail); });
 async function pushEnable() {
   try {
     if (!("serviceWorker" in navigator) || !("PushManager" in window) || !("Notification" in window)) { toast("Open Lift Log from its Home Screen icon first."); return; }
@@ -471,7 +482,7 @@ async function connect() {
   const fail = e => { clearTimeout(timer); console.warn(e); S.conn = "off"; render(); };
   const live = s => { if (!s.metadata.fromCache) ok(); if (!S.active) render(); };
   db.collection("routines").onSnapshot(s => { S.routines = s.docs.map(d => ({ id: d.id, ...d.data() })); live(s); }, fail);
-  db.doc("config/main").onSnapshot(s => { S.config = s.exists ? s.data() : { schedule: {} }; live(s); }, fail);
+  db.doc("config/main").onSnapshot(s => { S.config = s.exists ? s.data() : { schedule: {} }; if (S.active) keepAwake(true); live(s); }, fail);
   db.collection("workouts").orderBy("startedAt", "desc").limit(1000).onSnapshot(s => { S.workouts = s.docs.map(d => ({ id: d.id, ...d.data() })); live(s); }, fail);
   db.collection("exnotes").onSnapshot(s => { const m = {}; s.docs.forEach(d => m[d.id] = d.data()); S.notes = m; if (S.active) refreshNotes(); else live(s); }, fail);
   db.collection("maxes").onSnapshot(s => { const m = {}; s.docs.forEach(d => m[d.id] = d.data()); S.maxes = m; live(s); }, fail);
@@ -504,14 +515,15 @@ const copyHandoff = w => { try { return navigator.clipboard.writeText(handoffTex
 let actx = null, wl = null;
 const unlockAudio = () => { try { actx = actx || new (window.AudioContext || window.webkitAudioContext)(); if (actx.state === "suspended") actx.resume(); } catch (e) { } };
 const beep = (f = 880, ms = 180, t0 = 0) => { try { if (!actx || !prefs().sound) return; const o = actx.createOscillator(), g = actx.createGain(), t = actx.currentTime + t0; o.frequency.value = f; o.connect(g); g.connect(actx.destination); g.gain.setValueAtTime(.2, t); g.gain.exponentialRampToValueAtTime(.001, t + ms / 1000); o.start(t); o.stop(t + ms / 1000); } catch (e) { } };
+const keepAwake = on => wake(on && prefs().awake);
 const wake = async on => { try { if (on && !wl && navigator.wakeLock) { wl = await navigator.wakeLock.request("screen"); wl.addEventListener("release", () => wl = null); } if (!on && wl) { await wl.release(); wl = null; } } catch (e) { } };
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") {
-    if (S.active) wake(true);
+    if (S.active) keepAwake(true);
     if (S.db) S.db.refresh();
     // A rest that ended while the phone was locked was already announced by the push; don't beep late.
     if (S.restEnd && Date.now() > S.restEnd + 1500) { S.restBeeped = true; S.restWarned = true; }
-  } else if (S.restEnd > Date.now() + 1500 && !PUSH.sched) pushSchedule(S.restEnd, S.restNext); // went to the background after the 6-second cutoff
+  } else if (S.restEnd > Date.now() + 1500 && (!PUSH.sched || PUSH.state === "fail")) pushSchedule(S.restEnd, S.restNext, S.restDetail); // went to the background after the 6-second cutoff
 });
 document.addEventListener("pointerdown", unlockAudio, { passive: true });
 
@@ -603,6 +615,7 @@ function bindCommon(v) {
   v.querySelectorAll("[data-pick]").forEach(b => b.onclick = sheetPickWorkout);
   v.querySelectorAll("[data-cardio]").forEach(b => b.onclick = sheetCardio);
   v.querySelectorAll("[data-iv]").forEach(b => b.onclick = () => sheetIntervals(b.dataset.iv === "pick" ? null : b.dataset.iv));
+  v.querySelectorAll("[data-export]").forEach(b => b.onclick = exportCsv);
 }
 
 // ───────────────────────── HISTORY ─────────────────────────
@@ -616,8 +629,20 @@ function viewHistory(v) {
     if (k !== cur) { cur = k; const n = ws.filter(x => ymd(weekStart(parseYmd(x.date))) === k), vol = n.reduce((a, x) => a + (x.volume || 0), 0); h += `${h ? "</div>" : ""}<h2>Week of ${parseYmd(k).toLocaleDateString(undefined, { month: "short", day: "numeric" })} · ${n.length} · ${fmtN(vol)} lb</h2><div class="hist">`; }
     h += woCard(w);
   });
-  v.innerHTML = h + "</div>";
+  v.innerHTML = h + `</div><div class="stack" style="margin-top:16px"><button class="btn block" data-export>⬇ Export all sets (CSV)</button></div>`;
   bindCommon(v);
+}
+function exportCsv() {
+  const q = x => { const t = String(x ?? ""); return /[",\n]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t; };
+  const rows = [["date", "workout", "location", "exercise", "variation", "set", "type", "weight_lb", "reps_or_sec", "rpe", "est_1rm_lb"]];
+  allWorkouts().slice().reverse().forEach(w => {
+    if (w.kind === "cardio") { rows.push([w.date, w.activity, "", "Cardio", "", "", "cardio", "", w.minutes, "", ""]); return; }
+    (w.exercises || []).forEach(e => { let n = 0; (e.sets || []).forEach(st => { const t = st.t || ""; rows.push([w.date, w.routine || "Workout", w.location ? locById(w.location).name : "", e.name, e.variation || "", t === "w" ? "W" : ++n, { "": "normal", w: "warm-up", d: "drop", f: "failure" }[t], num(st.w) || "", num(st.r), st.rpe || "", t === "w" ? "" : Math.round(e1rmS(st)) || ""]); }); });
+  });
+  const blob = new Blob([rows.map(r => r.map(q).join(",")).join("\n")], { type: "text/csv" }), name = `lift-log-${ymd(new Date())}.csv`;
+  const file = window.File ? new File([blob], name, { type: "text/csv" }) : null;
+  if (file && navigator.canShare && navigator.canShare({ files: [file] })) { navigator.share({ files: [file], title: "Lift Log export" }).catch(() => { }); return; }
+  const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = name; document.body.appendChild(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
 }
 
 // ───────────────────────── PROGRESS ─────────────────────────
@@ -723,7 +748,7 @@ function viewRoutines(v) {
     <button class="btn primary block" data-start="${esc(r.id)}">Start</button></div>`);
   h += `</div><div class="stack" style="margin-top:12px"><button class="btn block" data-new>New routine</button><button class="btn block" data-empty>Start an empty workout</button><button class="btn block" data-cardio>Log cardio</button><button class="btn block" data-iv="pick">⏱ Interval / HIIT timer</button></div>`;
   const P = prefs();
-  h += `<h2>Alerts and warm-ups</h2><div class="card">${[["sound", "Beeps", "Countdown beeps at the end of rests and timers"], ["voice", "Spoken cues", "\"Rest over. Bench Press, set 3\" (great with AirPods)"], ["warn10", "10-second warning", "A heads-up before each rest ends"], ["warmup", "Warm-up set on each lift", "Adds a warm-up set at 50% of your max (or 60% of last time's top weight)"]].map(([k, t, d]) => `<div class="toggle ${P[k] ? "on" : ""}" data-pref="${k}" role="switch" aria-checked="${P[k]}" tabindex="0"><div><b>${t}</b><div class="tiny muted">${esc(d)}</div></div><span class="sw"></span></div>`).join("")}
+  h += `<h2>Alerts and warm-ups</h2><div class="card">${[["sound", "Beeps", "Countdown beeps at the end of rests and timers"], ["voice", "Spoken cues", "\"Rest over. Bench Press, set 3\" (great with AirPods)"], ["warn10", "10-second warning", "A heads-up before each rest ends"], ["warmup", "Warm-up set on each lift", "Adds a warm-up set at 50% of your max (or 60% of last time's top weight)"], ["awake", "Keep screen on", "Stops the screen sleeping during a workout. Not needed for rest alerts, and uses more battery."]].map(([k, t, d]) => `<div class="toggle ${P[k] ? "on" : ""}" data-pref="${k}" role="switch" aria-checked="${P[k]}" tabindex="0"><div><b>${t}</b><div class="tiny muted">${esc(d)}</div></div><span class="sw"></span></div>`).join("")}
     <div class="tiny muted" style="margin-top:8px">Beeps and spoken cues play while Lift Log is on screen. With the screen off, the notification setting below pings you when each rest ends.</div></div>`;
   h += pushCard();
   h += `<h2>Apple Watch and Health</h2><div class="note">Lift Log runs on your iPhone. Web pages can't write to Apple Health, so start the watch's Workout app (Traditional Strength Training) alongside it: that saves time, heart rate and calories to Health. Your sets stay in Lift Log and your vault.</div>`;
@@ -731,7 +756,7 @@ function viewRoutines(v) {
   bindPush(v);
   v.querySelectorAll("[data-day]").forEach(s => s.onchange = () => { const schedule = { ...((S.config && S.config.schedule) || {}) }; schedule[s.dataset.day] = s.value; S.config = { ...(S.config || {}), schedule }; saveConfig().then(() => toast("Schedule saved")).catch(() => toast("Couldn't save. Check your connection.")); });
   v.querySelectorAll("[data-eq]").forEach(b => b.onclick = () => { toggleEquip(b.dataset.loc, b.dataset.eq); render(); });
-  v.querySelectorAll("[data-pref]").forEach(b => b.onclick = () => { const k = b.dataset.pref, p = { ...prefs(), [k]: !prefs()[k] }; S.config = { ...(S.config || {}), prefs: p }; render(); saveConfig().catch(() => toast("Couldn't save. Check your connection.")); if (k === "voice" && p.voice) say("Spoken cues on"); });
+  v.querySelectorAll("[data-pref]").forEach(b => b.onclick = () => { const k = b.dataset.pref, p = { ...prefs(), [k]: !prefs()[k] }; S.config = { ...(S.config || {}), prefs: p }; render(); saveConfig().catch(() => toast("Couldn't save. Check your connection.")); if (k === "voice" && p.voice) say("Spoken cues on"); if (k === "awake") keepAwake(!!S.active); });
   v.querySelectorAll("[data-edit]").forEach(b => b.onclick = () => sheetRoutine(rs.find(r => r.id === b.dataset.edit)));
   $("[data-new]", v).onclick = () => sheetRoutine(null);
   $("[data-empty]", v).onclick = () => sheetStart(null);
@@ -900,7 +925,7 @@ function startWorkout(r, loc, ladder) {
       return { name: sw, variation, swappedFrom: swapped ? e.name : "", rest: num(e.rest) || 90, target: `${e.sets} × ${e.reps}`, ss: !!e.superset, sets };
     }),
   };
-  saveActive(true); wake(true); window.scrollTo(0, 0); render();
+  saveActive(true); keepAwake(true); window.scrollTo(0, 0); render();
 }
 let clockT = null, restT = null;
 function renderActive() {
@@ -1052,18 +1077,28 @@ function afterSet(i, j) {
     const k = nextIn(X[i + 1], 0);
     if (k >= 0) { S.restEnd = 0; drawRest(); toast(`Superset: now ${X[i + 1].name}`); say(`Now ${X[i + 1].name}`); scrollToSet(i + 1, k); return; }
   }
-  let txt = "";
-  if (g && i === g.last) { const k0 = nextIn(X[g.first], 0); if (k0 >= 0) txt = `${X[g.first].name}, next round`; }
-  if (!txt) { const k = nextIn(e, j + 1); if (k >= 0) txt = `${e.name}, ${e.sets[k].t === "w" ? "warm-up" : "set " + setLabel(e, k)}`; }
-  if (!txt) { const ni = X.findIndex((x, q) => q > i && x.sets.some(s => !s.done)); if (ni >= 0) txt = X[ni].name; else txt = "Last set done. Tap Finish when you're ready."; }
-  startRest(e.sets[j].t === "w" ? Math.min(60, e.rest) : e.rest, txt);
+  let txt = "", det = "";
+  if (g && i === g.last) { const k0 = nextIn(X[g.first], 0); if (k0 >= 0) { txt = `${X[g.first].name}, next round`; det = setHint(g.first, k0); } }
+  if (!txt) { const k = nextIn(e, j + 1); if (k >= 0) { txt = `${e.name}, ${e.sets[k].t === "w" ? "warm-up" : "set " + setLabel(e, k)}`; det = setHint(i, k); } }
+  if (!txt) { const ni = X.findIndex((x, q) => q > i && x.sets.some(s => !s.done)); if (ni >= 0) { txt = X[ni].name; det = setHint(ni, X[ni].sets.findIndex(s => !s.done)); } else txt = "Last set done. Tap Finish when you're ready."; }
+  startRest(e.sets[j].t === "w" ? Math.min(60, e.rest) : e.rest, txt, det);
 }
-function startRest(sec, nextTxt) { S.restLen = sec; S.restEnd = Date.now() + sec * 1000; S.restBeeped = false; S.restWarned = false; S.restNext = nextTxt || ""; drawRest(); pushSchedule(S.restEnd, S.restNext); }
+// What the next set is: what you typed, else the hint shown in its boxes (last time, suggestion or target).
+function setHint(i, k) {
+  const e = S.active.exercises[i], s = e && e.sets[k], card = document.querySelectorAll("#exs .ex")[i];
+  if (!s) return "";
+  const row = card && card.querySelector(`.set[data-j="${k}"]`), wi = row && row.querySelector("[data-w]"), ri = row && row.querySelector("[data-r]");
+  const w = num(s.w || (wi && wi.placeholder) || s.pw), r = num(s.r || (ri && ri.placeholder) || s.pr), t = info(e.name).type;
+  if (t === "t") return r ? `${r} s` : "";
+  if (t === "bw") return r ? (w ? `+${w} lb × ${r}` : `${r} reps`) : "";
+  return w && r ? `${w} lb × ${r}` : w ? `${w} lb` : "";
+}
+function startRest(sec, nextTxt, detail) { S.restLen = sec; S.restEnd = Date.now() + sec * 1000; S.restBeeped = false; S.restWarned = false; S.restNext = nextTxt || ""; S.restDetail = detail || ""; drawRest(); pushSchedule(S.restEnd, S.restNext, S.restDetail); }
 function drawRest() {
   const box = $("#restbox"); if (!box) return;
   clearInterval(restT);
   if (S.hold || !S.restEnd) { if (!S.hold) box.innerHTML = ""; if (!S.restEnd) pushCancel(); return; }
-  box.innerHTML = `<div class="rest" role="timer"><div class="rest-bar"><i id="rbar"></i></div><div class="rest-in"><div class="grow"><div class="tiny muted">Rest${S.restNext ? " · next: " + esc(S.restNext) : ""}</div><div class="rest-t" id="rt"></div></div>
+  box.innerHTML = `<div class="rest" role="timer"><div class="rest-bar"><i id="rbar"></i></div><div class="rest-in"><div class="grow"><div class="tiny muted">Rest${S.restNext ? " · next: " + esc(S.restNext) + (S.restDetail ? " · " + esc(S.restDetail) : "") : ""}</div><div class="rest-t" id="rt"></div><div id="pingst"></div></div>
     <button class="btn sm" id="rm15">−15</button><button class="btn sm" id="rp15">+15</button><button class="btn sm primary" id="rskip">Skip</button></div></div>`;
   const tick = () => {
     const left = (S.restEnd - Date.now()) / 1000, el = $("#rt"); if (!el) return clearInterval(restT);
@@ -1071,6 +1106,7 @@ function drawRest() {
     $("#rbar").style.width = Math.max(0, Math.min(100, left / S.restLen * 100)) + "%";
     box.firstChild.classList.toggle("over", left < 0);
     if (left <= 6 && PUSH.sched && document.visibilityState === "visible") pushCancel(); // watching the screen: the in-app alert covers it
+    if (PUSH.state === "fail" && PUSH.sched && left > 8 && Date.now() - PUSH.tried > 5000) pushSchedule(S.restEnd, S.restNext, S.restDetail);
     if (prefs().warn10 && S.restLen > 20 && left <= 10 && left > 9 && !S.restWarned) { S.restWarned = true; beep(660, 120); say("10 seconds"); }
     if (left <= 3.5 && left > 0.5 && Math.abs(left - Math.round(left)) < .26) beep(560, 90);
     if (left <= 0 && !S.restBeeped) {
@@ -1080,9 +1116,9 @@ function drawRest() {
     }
     if (left < -90) { S.restEnd = 0; drawRest(); }
   };
-  tick(); restT = setInterval(tick, 250);
-  $("#rm15").onclick = () => { S.restEnd -= 15000; tick(); pushSchedule(S.restEnd, S.restNext); };
-  $("#rp15").onclick = () => { S.restEnd += 15000; S.restLen += 15; S.restBeeped = false; S.restWarned = false; tick(); pushSchedule(S.restEnd, S.restNext); };
+  tick(); restT = setInterval(tick, 250); pingUI();
+  $("#rm15").onclick = () => { S.restEnd -= 15000; tick(); pushSchedule(S.restEnd, S.restNext, S.restDetail); };
+  $("#rp15").onclick = () => { S.restEnd += 15000; S.restLen += 15; S.restBeeped = false; S.restWarned = false; tick(); pushSchedule(S.restEnd, S.restNext, S.restDetail); };
   $("#rskip").onclick = () => { S.restEnd = 0; drawRest(); };
 }
 // Timed sets (planks, holds): 3-second get-ready, then a countdown to the target, or a stopwatch if there's no target.
@@ -1170,7 +1206,7 @@ function sheetIntervals(presetId) {
       <div class="chips" style="margin:10px 0">${IV_PRESETS.map(p => `<button class="chip ${cfg.name === p.name ? "on" : ""}" data-p="${p.id}">${esc(p.name)}</button>`).join("")}</div>
       <div class="grid2" style="grid-template-columns:1fr 1fr 1fr"><div class="field"><label for="iw">Work (sec)</label><input id="iw" inputmode="numeric" value="${cfg.work}"></div><div class="field"><label for="ir">Rest (sec)</label><input id="ir" inputmode="numeric" value="${cfg.rest}"></div><div class="field"><label for="in">Rounds</label><input id="in" inputmode="numeric" value="${cfg.rounds}"></div></div>
       <div class="field" style="margin-top:10px"><label for="ii">Exercises, one per line (optional; each round goes through all of them)</label><textarea id="ii" class="search" style="height:auto;min-height:90px;padding:10px 14px;white-space:pre-wrap">${esc((cfg.items || []).join("\n"))}</textarea></div>
-      <p class="tiny muted">Total about ${mmss(total)} including a 10-second get-ready.</p>
+      <p class="tiny muted">Total about ${mmss(total)} including a 10-second get-ready.${PUSH.on ? " With the screen off you get a ping at each change (within a few seconds, so very short intervals are best watched on screen)." : ""}</p>
       <div class="stack" style="margin-top:8px"><button class="btn primary block" id="go">Start</button><button class="btn block" id="x">Cancel</button></div>`;
     s.querySelectorAll("[data-p]").forEach(b => b.onclick = () => { cfg = JSON.parse(JSON.stringify(IV_PRESETS.find(p => p.id === b.dataset.p))); draw(s); });
     const read = () => { cfg.work = Math.max(5, num($("#iw", s).value) || 30); cfg.rest = Math.max(0, num($("#ir", s).value)); cfg.rounds = Math.max(1, Math.min(99, num($("#in", s).value) || 1)); cfg.items = $("#ii", s).value.split("\n").map(x => x.trim()).filter(Boolean).slice(0, 30); };
@@ -1181,50 +1217,85 @@ function sheetIntervals(presetId) {
   sheet("", draw);
 }
 function runIntervals(cfg) {
-  const seq = [{ phase: "prep", secs: 10, label: "Get ready" }], items = cfg.items && cfg.items.length ? cfg.items : [""];
+  const items = cfg.items && cfg.items.length ? cfg.items : [""];
+  const seq = [{ phase: "prep", secs: 10, label: "Get ready" }];
   for (let r = 1; r <= cfg.rounds; r++) items.forEach((it, k) => {
     seq.push({ phase: "work", secs: cfg.work, label: it || "Work", round: r, k });
     const lastOne = r === cfg.rounds && k === items.length - 1;
     if (cfg.rest && !lastOne) seq.push({ phase: "rest", secs: cfg.rest, label: "Rest", round: r, k });
   });
+  let TOTAL = 0; seq.forEach(p => { p.start = TOTAL; TOTAL += p.secs; });
   const ov = document.createElement("div"); ov.className = "hiit prep"; ov.setAttribute("role", "timer"); document.body.appendChild(ov);
-  let idx = 0, end = Date.now() + seq[0].secs * 1000, paused = 0, t = null, lastWhole = null; const started = Date.now();
-  wake(true);
-  const announce = () => { const p = seq[idx], nx = seq[idx + 1]; beep(p.phase === "work" ? 988 : 660, 240); say(p.phase === "work" ? (p.label === "Work" ? "Go" : p.label) : p.phase === "rest" ? (nx ? `Rest. Next: ${nx.label === "Work" ? "work" : nx.label}` : "Rest") : `Get ready. First: ${seq[1] ? seq[1].label : "work"}`); };
+  // Position comes from the clock, not from counting ticks, so it's still right after the screen has been off.
+  let idx = 0, t0 = Date.now(), pausedAt = 0, pausedTot = 0, t = null, lastWhole = null, finished = false, cut = -1; const started = t0;
+  const elapsed = () => ((pausedAt || Date.now()) - t0 - pausedTot) / 1000;
+  const nm = p => p.label === "Work" ? "work" : p.label;
+  keepAwake(true);
+  // Pings: one row per upcoming phase change, rescheduled on pause/resume/skip and when you leave the app.
+  const Q = () => S.db.sb.from("lift_push_queue");
+  const pushAll = () => {
+    if (!PUSH.on || !S.db || finished || pausedAt) return;
+    const base = Date.now() - elapsed() * 1000, rows = [];
+    for (let n = idx + 1; n < seq.length && rows.length < 150; n++) {
+      const p = seq[n], nx = seq[n + 1];
+      if (n === cut) continue;
+      rows.push({ id: "hiit-" + n, fire_at: new Date(base + p.start * 1000 - 2000).toISOString(), tag: "hiit", sent: false,
+        title: p.phase === "work" ? (p.label === "Work" ? "Go!" : "Go: " + p.label) : "Rest" + (nx ? " · next: " + nm(nx) : ""),
+        body: `${cfg.name} · round ${p.round} of ${cfg.rounds}` });
+    }
+    if (cut !== seq.length) rows.push({ id: "hiit-end", fire_at: new Date(base + TOTAL * 1000 - 2000).toISOString(), tag: "hiit", sent: false, title: "Done", body: `${cfg.name} complete. Nice work.` });
+    pushQ(() => Q().delete().like("id", "hiit-%").then(() => rows.length ? Q().upsert(rows) : null));
+  };
+  const pushNone = () => { if (PUSH.on && S.db) pushQ(() => Q().delete().like("id", "hiit-%")); };
+  const onVis = () => { if (document.visibilityState === "hidden") { cut = -1; pushAll(); } };
+  document.addEventListener("visibilitychange", onVis);
+  const announce = () => { const p = seq[idx], nx = seq[idx + 1]; beep(p.phase === "work" ? 988 : 660, 240); say(p.phase === "work" ? (p.label === "Work" ? "Go" : p.label) : p.phase === "rest" ? (nx ? `Rest. Next: ${nm(nx)}` : "Rest") : `Get ready. First: ${seq[1] ? seq[1].label : "work"}`); };
+  const toggle = () => {
+    if (finished) return;
+    if (pausedAt) { pausedTot += Date.now() - pausedAt; pausedAt = 0; pushAll(); } else { pausedAt = Date.now(); pushNone(); }
+    draw();
+  };
+  const skip = () => { const nx = seq[idx + 1]; if (!nx) return done(false); t0 -= (nx.start - elapsed()) * 1000; idx++; lastWhole = null; cut = -1; announce(); draw(); pushAll(); };
   const draw = () => {
-    const p = seq[idx], nx = seq[idx + 1], left = Math.max(0, (paused ? paused : end - Date.now()) / 1000);
+    const p = seq[idx], nx = seq[idx + 1], left = Math.max(0, p.start + p.secs - elapsed());
     ov.className = "hiit " + p.phase;
     ov.innerHTML = `<div class="phase">${p.phase === "prep" ? "Get ready" : p.phase === "work" ? "Work" : "Rest"}</div><div class="count">${Math.ceil(left)}</div>
-      <div class="lbl">${esc(p.phase === "work" ? (p.label === "Work" ? cfg.name : p.label) : nx ? "Next: " + (nx.label === "Work" ? "work" : nx.label) : "")}</div>
+      <div class="lbl">${esc(p.phase === "work" ? (p.label === "Work" ? cfg.name : p.label) : nx ? "Next: " + nm(nx) : "")}</div>
       <div class="meta">${p.round ? `Round ${p.round} of ${cfg.rounds}${items.length > 1 ? ` · ${p.k + 1} of ${items.length}` : ""}` : esc(cfg.name)}</div>
-      <div class="row" style="margin-top:18px"><button class="btn" id="ivp">${paused ? "▶ Resume" : "⏸ Pause"}</button><button class="btn" id="ivs">⏭ Skip</button><button class="btn" id="ivx">✕ Stop</button></div>`;
-    $("#ivp", ov).onclick = () => { if (paused) { end = Date.now() + paused; paused = 0; } else paused = end - Date.now(); draw(); };
-    $("#ivs", ov).onclick = () => next();
+      <div class="row" style="margin-top:18px"><button class="btn" id="ivp">${pausedAt ? "▶ Resume" : "⏸ Pause"}</button><button class="btn" id="ivs">⏭ Skip</button><button class="btn" id="ivx">✕ Stop</button></div>`;
+    $("#ivp", ov).onclick = toggle;
+    $("#ivs", ov).onclick = skip;
     $("#ivx", ov).onclick = () => done(true);
   };
-  const next = () => { idx++; if (idx >= seq.length) return done(false); end = Date.now() + seq[idx].secs * 1000; paused = 0; lastWhole = null; announce(); draw(); };
   const done = stopped => {
-    clearInterval(t); if (!S.active) wake(false);
-    const mins = Math.max(1, Math.round((Date.now() - started) / 60000));
+    if (finished) return; finished = true;
+    clearInterval(t); document.removeEventListener("visibilitychange", onVis); pushNone(); if (!S.active) wake(false);
+    const dur = Math.min(elapsed(), TOTAL), late = elapsed() - TOTAL, mins = Math.max(1, Math.round(dur / 60));
     if (stopped && idx <= 1) { ov.remove(); return; }
-    beep(988, 200); beep(1318, 300, .22); say(stopped ? "Stopped" : "Done. Nice work.");
+    if (stopped || late < 2) { beep(988, 200); beep(1318, 300, .22); say(stopped ? "Stopped" : "Done. Nice work."); }
     ov.className = "hiit work";
-    ov.innerHTML = `<div class="phase">${stopped ? "Stopped" : "Done"}</div><div class="count" style="font-size:min(24vw,120px)">${mmss((Date.now() - started) / 1000)}</div><div class="lbl">${esc(cfg.name)}</div>
+    ov.innerHTML = `<div class="phase">${stopped ? "Stopped" : "Done"}</div><div class="count" style="font-size:min(24vw,120px)">${mmss(dur)}</div><div class="lbl">${esc(cfg.name)}</div>
       <div class="stack" style="margin-top:18px;width:min(100%,360px)">${cfg.save && !S.active ? `<button class="btn block" id="ivsave">Save as a ${mins}-minute workout</button>` : ""}<button class="btn block" id="ivc">Close</button></div>`;
     const sv = $("#ivsave", ov); if (sv) sv.onclick = () => {
-      const w = { id: uid(), kind: "cardio", date: ymd(new Date()), activity: cfg.name, minutes: mins, distance: null, startedAt: started, endedAt: Date.now(), volume: 0, setsDone: 0, prs: [], createdAt: Date.now(), intervals: { work: cfg.work, rest: cfg.rest, rounds: cfg.rounds } };
+      const w = { id: uid(), kind: "cardio", date: ymd(new Date()), activity: cfg.name, minutes: mins, distance: null, startedAt: started, endedAt: started + Math.round(dur * 1000), volume: 0, setsDone: 0, prs: [], createdAt: Date.now(), intervals: { work: cfg.work, rest: cfg.rest, rounds: cfg.rounds } };
       const copied = copyHandoff(w); ov.remove();
       saveWorkout(w, () => copied.then(ok => toast(ok ? `${cfg.name} saved and copied. Tick Workout in your daily note.` : `${cfg.name} saved`)));
     };
     $("#ivc", ov).onclick = () => ov.remove();
   };
-  announce(); draw();
+  announce(); draw(); pushAll();
   t = setInterval(() => {
-    if (paused || !ov.isConnected) { if (!ov.isConnected) clearInterval(t); return; }
-    const left = (end - Date.now()) / 1000, c = $(".count", ov);
+    if (!ov.isConnected) { clearInterval(t); return; }
+    if (finished) return;
+    const el = elapsed(); if (el >= TOTAL) return done(false);
+    let n = idx; while (n < seq.length - 1 && el >= seq[n + 1].start) n++;
+    if (n !== idx) { const fresh = el - seq[n].start < 1.5; idx = n; lastWhole = null; if (fresh) announce(); draw(); }
+    const p = seq[idx], left = p.start + p.secs - el, c = $(".count", ov);
     if (c) c.textContent = Math.ceil(Math.max(0, left));
-    const w = Math.ceil(left); if (left <= 3.2 && left > 0.2 && w !== lastWhole) { lastWhole = w; beep(560, 90); }
-    if (left <= 0) next();
+    // On screen near a phase change: the in-app beep covers it, so drop that one ping.
+    const nextN = idx + 1 < seq.length ? idx + 1 : seq.length;
+    if (!pausedAt && left <= 6 && cut !== nextN && document.visibilityState === "visible" && PUSH.on && S.db) { cut = nextN; pushQ(() => Q().delete().eq("id", nextN === seq.length ? "hiit-end" : "hiit-" + nextN)); }
+    if (!pausedAt) { const w = Math.ceil(left); if (left <= 3.2 && left > 0.2 && w !== lastWhole) { lastWhole = w; beep(560, 90); } }
   }, 200);
 }
 
@@ -1253,7 +1324,7 @@ function summary(w, copied, ctx) {
 
 // ───────────────────────── boot ─────────────────────────
 render();
-if (S.active) wake(true);
+if (S.active) keepAwake(true);
 connect();
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => { });
 })();
